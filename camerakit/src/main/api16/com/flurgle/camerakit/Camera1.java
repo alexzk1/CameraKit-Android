@@ -17,10 +17,10 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.flurgle.camerakit.CameraKit.Constants.FLASH_OFF;
 import static com.flurgle.camerakit.CameraKit.Constants.FOCUS_CONTINUOUS;
@@ -30,8 +30,9 @@ import static com.flurgle.camerakit.CameraKit.Constants.METHOD_STANDARD;
 import static com.flurgle.camerakit.CameraKit.Constants.METHOD_STILL;
 
 @SuppressWarnings("deprecation")
-public class Camera1 extends CameraImpl {
-
+public class Camera1 extends CameraImpl
+{
+    
     private static final String TAG = Camera1.class.getSimpleName();
 
     private static final int FOCUS_AREA_SIZE_DEFAULT = 300;
@@ -48,7 +49,7 @@ public class Camera1 extends CameraImpl {
     private MediaRecorder mMediaRecorder;
     private File mVideoFile;
     private Camera.AutoFocusCallback mAutofocusCallback;
-    private boolean capturingImage = false;
+    private volatile boolean capturingImage = false;
 
     private int mDisplayOrientation;
 
@@ -72,14 +73,21 @@ public class Camera1 extends CameraImpl {
 
     private Handler mHandler = new Handler();
 
-    Camera1(CameraListener callback, PreviewImpl preview) {
+    Camera1(CameraListener callback, PreviewImpl preview)
+    {
         super(callback, preview);
-        preview.setCallback(new PreviewImpl.Callback() {
+        preview.setCallback(new PreviewImpl.Callback()
+        {
             @Override
-            public void onSurfaceChanged() {
-                if (mCamera != null) {
-                    setupPreview();
-                    adjustCameraParameters();
+            public void onSurfaceChanged()
+            {
+                synchronized (Camera1.this)
+                {
+                    if (mCamera != null)
+                    {
+                        setupPreview();
+                        adjustCameraParameters();
+                    }
                 }
             }
         });
@@ -91,119 +99,170 @@ public class Camera1 extends CameraImpl {
     // CameraImpl:
 
     @Override
-    void start() {
-        setFacing(mFacing);
-        openCamera();
-        if (mPreview.isReady()) setupPreview();
-        mCamera.startPreview();
-    }
-
-    @Override
-    void stop() {
-        if (mCamera != null) mCamera.stopPreview();
-        mHandler.removeCallbacksAndMessages(null);
-        releaseCamera();
-    }
-
-    @Override
-    void setDisplayOrientation(int displayOrientation) {
-        this.mDisplayOrientation = displayOrientation;
-    }
-
-    @Override
-    void setFacing(@Facing int facing) {
-        int internalFacing = new ConstantMapper.Facing(facing).map();
-        if (internalFacing == -1) {
-            return;
+    void start()
+    {
+        synchronized (this)
+        {
+            setFacing(mFacing);
+            openCamera();
+            if (mPreview.isReady()) setupPreview();
+            mCamera.startPreview();
         }
+    }
 
-        for (int i = 0, count = Camera.getNumberOfCameras(); i < count; i++) {
-            Camera.getCameraInfo(i, mCameraInfo);
-            if (mCameraInfo.facing == internalFacing) {
-                mCameraId = i;
-                mFacing = facing;
-                break;
+    @Override
+    void stop()
+    {
+        synchronized (this)
+        {
+            if (mCamera != null) mCamera.stopPreview();
+            mHandler.removeCallbacksAndMessages(null);
+            releaseCamera();
+        }
+    }
+
+    @Override
+    void setDisplayOrientation(int displayOrientation)
+    {
+        synchronized (this)
+        {
+            this.mDisplayOrientation = displayOrientation;
+        }
+    }
+
+    @Override
+    void setFacing(@Facing int facing)
+    {
+        synchronized (this)
+        {
+            int internalFacing = new ConstantMapper.Facing(facing).map();
+            if (internalFacing == -1)
+            {
+                return;
+            }
+
+            for (int i = 0, count = Camera.getNumberOfCameras(); i < count; i++)
+            {
+                Camera.getCameraInfo(i, mCameraInfo);
+                if (mCameraInfo.facing == internalFacing)
+                {
+                    mCameraId = i;
+                    mFacing = facing;
+                    break;
+                }
+            }
+
+            if (mFacing == facing && isCameraOpened())
+            {
+                stop();
+                start();
             }
         }
-
-        if (mFacing == facing && isCameraOpened()) {
-            stop();
-            start();
-        }
     }
 
     @Override
-    void setFlash(@Flash int flash) {
-        if (mCameraParameters != null) {
-            List<String> flashes = mCameraParameters.getSupportedFlashModes();
-            String internalFlash = new ConstantMapper.Flash(flash).map();
-            if (flashes != null && flashes.contains(internalFlash)) {
-                mCameraParameters.setFlashMode(internalFlash);
+    void setFlash(@Flash int flash)
+    {
+        synchronized (this)
+        {
+            if (mCameraParameters != null)
+            {
+                List<String> flashes = mCameraParameters.getSupportedFlashModes();
+                String internalFlash = new ConstantMapper.Flash(flash).map();
+                if (flashes != null && flashes.contains(internalFlash))
+                {
+                    mCameraParameters.setFlashMode(internalFlash);
+                    mFlash = flash;
+                } else
+                {
+                    String currentFlash = new ConstantMapper.Flash(mFlash).map();
+                    if (flashes == null || !flashes.contains(currentFlash))
+                    {
+                        mCameraParameters.setFlashMode(Camera.Parameters.FLASH_MODE_OFF);
+                        mFlash = FLASH_OFF;
+                    }
+                }
+
+                mCamera.setParameters(mCameraParameters);
+            } else
+            {
                 mFlash = flash;
-            } else {
-                String currentFlash = new ConstantMapper.Flash(mFlash).map();
-                if (flashes == null || !flashes.contains(currentFlash)) {
-                    mCameraParameters.setFlashMode(Camera.Parameters.FLASH_MODE_OFF);
-                    mFlash = FLASH_OFF;
-                }
             }
-
-            mCamera.setParameters(mCameraParameters);
-        } else {
-            mFlash = flash;
         }
     }
 
     @Override
-    void setFocus(@Focus int focus) {
-        this.mFocus = focus;
-        switch (focus) {
-            case FOCUS_CONTINUOUS:
-                if (mCameraParameters != null) {
-                    detachFocusTapListener();
-                    final List<String> modes = mCameraParameters.getSupportedFocusModes();
-                    if (modes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                        mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-                    } else {
-                        setFocus(FOCUS_OFF);
+    void setFocus(@Focus int focus)
+    {
+        synchronized (this)
+        {
+            this.mFocus = focus;
+            switch (focus)
+            {
+                case FOCUS_CONTINUOUS:
+                    if (mCameraParameters != null)
+                    {
+                        detachFocusTapListener();
+                        final List<String> modes = mCameraParameters.getSupportedFocusModes();
+                        if (modes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE))
+                        {
+                            mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                        } else
+                        {
+                            setFocus(FOCUS_OFF);
+                        }
                     }
-                }
-                break;
+                    break;
 
-            case FOCUS_TAP:
-                if (mCameraParameters != null) {
-                    attachFocusTapListener();
-                    final List<String> modes = mCameraParameters.getSupportedFocusModes();
-                    if (modes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                        mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                case FOCUS_TAP:
+                    if (mCameraParameters != null)
+                    {
+                        attachFocusTapListener();
+                        final List<String> modes = mCameraParameters.getSupportedFocusModes();
+                        if (modes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE))
+                        {
+                            mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+                        }
                     }
-                }
-                break;
+                    break;
 
-            case FOCUS_OFF:
-                if (mCameraParameters != null) {
-                    detachFocusTapListener();
-                    final List<String> modes = mCameraParameters.getSupportedFocusModes();
-                    if (modes.contains(Camera.Parameters.FOCUS_MODE_FIXED)) {
-                        mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_FIXED);
-                    } else if (modes.contains(Camera.Parameters.FOCUS_MODE_INFINITY)) {
-                        mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
-                    } else {
-                        mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                case FOCUS_OFF:
+                    if (mCameraParameters != null)
+                    {
+                        detachFocusTapListener();
+                        final List<String> modes = mCameraParameters.getSupportedFocusModes();
+                        if (modes.contains(Camera.Parameters.FOCUS_MODE_FIXED))
+                        {
+                            mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_FIXED);
+                        } else if (modes.contains(Camera.Parameters.FOCUS_MODE_INFINITY))
+                        {
+                            mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_INFINITY);
+                        } else
+                        {
+                            mCameraParameters.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                        }
                     }
-                }
-                break;
+                    break;
+            }
         }
     }
 
     @Override
-    void setMethod(@Method int method) {
-        this.mMethod = method;
+    void setMethod(@Method int method)
+    {
+        synchronized (this)
+        {
+            this.mMethod = method;
+        }
     }
 
     @Override
-    void setZoom(@Zoom int zoom) {
-        this.mZoom = zoom;
+    void setZoom(@Zoom int zoom)
+    {
+        synchronized (this)
+        {
+            this.mZoom = zoom;
+        }
     }
 
     @Override
@@ -213,68 +272,95 @@ public class Camera1 extends CameraImpl {
 
     @Override
     void captureImage() {
-        switch (mMethod) {
-            case METHOD_STANDARD:
-                // Null check required for camera here as is briefly null when View is detached
-                if (!capturingImage && mCamera != null) {
+        synchronized (this)
+        {
+            switch (mMethod)
+            {
+                case METHOD_STANDARD:
+                    // Null check required for camera here as is briefly null when View is detached
+                    if (!capturingImage && mCamera != null)
+                    {
 
-                    // Set boolean to wait for image callback
-                    capturingImage = true;
+                        // Set boolean to wait for image callback
+                        capturingImage = true;
 
-                    mCamera.takePicture(null, null, null,
-                        new Camera.PictureCallback() {
-                            @Override
-                            public void onPictureTaken(byte[] data, Camera camera) {
-                                mCameraListener.onPictureTaken(data);
-
-                                // Reset capturing state to allow photos to be taken
-                                capturingImage = false;
-
-                                camera.startPreview();
-                            }
-                        });
-                }
-                else {
-                    Log.w(TAG, "Unable, waiting for picture to be taken");
-                }
-                break;
-
-            case METHOD_STILL:
-                mCamera.setOneShotPreviewCallback(new Camera.PreviewCallback() {
-                    @Override
-                    public void onPreviewFrame(byte[] data, Camera camera) {
-                        new Thread(new ProcessStillTask(data, camera, calculateCaptureRotation(), new ProcessStillTask.OnStillProcessedListener() {
-                            @Override
-                            public void onStillProcessed(final YuvImage yuv) {
-                                mCameraListener.onPictureTaken(yuv);
-                            }
-                        })).start();
+                        mCamera.takePicture(null, null, null,
+                                new Camera.PictureCallback()
+                                {
+                                    @Override
+                                    public void onPictureTaken(byte[] data, Camera camera)
+                                    {
+                                        synchronized (Camera1.this)
+                                        {
+                                            mCameraListener.onPictureTaken(data);
+                                            // Reset capturing state to allow photos to be taken
+                                            capturingImage = false;
+                                            camera.startPreview();
+                                        }
+                                    }
+                                });
+                    } else
+                    {
+                        Log.w(TAG, "Unable, waiting for picture to be taken");
                     }
-                });
-                break;
+                    break;
+
+                case METHOD_STILL:
+                    mCamera.setOneShotPreviewCallback(new Camera.PreviewCallback()
+                    {
+                        @Override
+                        public void onPreviewFrame(byte[] data, Camera camera)
+                        {
+                            new Thread(new ProcessStillTask(data, camera, calculateCaptureRotation(), new ProcessStillTask.OnStillProcessedListener()
+                            {
+                                @Override
+                                public void onStillProcessed(final YuvImage yuv)
+                                {
+                                    mCameraListener.onPictureTaken(yuv);
+                                }
+                            })).start();
+                        }
+                    });
+                    break;
+            }
         }
     }
 
     @Override
-    void startVideo() {
-        initMediaRecorder();
-        prepareMediaRecorder();
-        mMediaRecorder.start();
+    void startVideo()
+    {
+        synchronized (this)
+        {
+            initMediaRecorder();
+            prepareMediaRecorder();
+            mMediaRecorder.start();
+        }
     }
 
     @Override
-    void endVideo() {
-        mMediaRecorder.stop();
-        mMediaRecorder.release();
-        mMediaRecorder = null;
-        mCameraListener.onVideoTaken(mVideoFile);
+    void endVideo()
+    {
+        synchronized (this)
+        {
+            mMediaRecorder.stop();
+            mMediaRecorder.release();
+            mMediaRecorder = null;
+            mCameraListener.onVideoTaken(mVideoFile);
+        }
+    }
+
+    private static <T> T assertNotNull(T object) {
+        if (object == null)
+            throw new AssertionError("Object cannot be null");
+        return object;
     }
 
     // Code from SandriosCamera library
     // https://github.com/sandrios/sandriosCamera/blob/master/sandriosCamera/src/main/java/com/sandrios/sandriosCamera/internal/utils/CameraHelper.java#L218
-    public static Size getSizeWithClosestRatio(List<Size> sizes, int width, int height)
+    private static Size getSizeWithClosestRatio(List<Size> sizes, int width, int height)
     {
         if (sizes == null) return null;
+        //assertNotNull(sizes);
 
         double MIN_TOLERANCE = 100;
         double targetRatio = (double) height / width;
@@ -307,23 +393,23 @@ public class Camera1 extends CameraImpl {
                 }
             }
         }
-        return optimalSize;
+        return assertNotNull(optimalSize);
     }
 
-    List<Size> sizesFromList(List<Camera.Size> sizes) {
+    private List<Size> sizesFromList(List<Camera.Size> sizes) {
         if (sizes == null) return null;
         List<Size> result = new ArrayList<>(sizes.size());
 
         for (Camera.Size size : sizes) {
             result.add(new Size(size.width, size.height));
         }
-
         return result;
     }
 
     // Code from SandriosCamera library
     // https://github.com/sandrios/sandriosCamera/blob/master/sandriosCamera/src/main/java/com/sandrios/sandriosCamera/internal/manager/impl/Camera1Manager.java#L212
-    void initResolutions() {
+    private void initResolutions()
+    {
         List<Size> previewSizes = sizesFromList(mCameraParameters.getSupportedPreviewSizes());
         List<Size> videoSizes = (Build.VERSION.SDK_INT > 10) ? sizesFromList(mCameraParameters.getSupportedVideoSizes()) : previewSizes;
 
@@ -359,19 +445,23 @@ public class Camera1 extends CameraImpl {
 
     // Internal:
 
-    private void openCamera() {
+    private void openCamera()
+    {
         if (mCamera != null) {
             releaseCamera();
         }
 
         mCamera = Camera.open(mCameraId);
+        if (mCamera == null)   //just checking against bad firmwares
+            throw new RuntimeException("Camera.open returned null instead exception.");
+
         mCameraParameters = mCamera.getParameters();
 
         collectCameraProperties();
         adjustCameraParameters();
         mCamera.setDisplayOrientation(calculatePreviewRotation());
-
         mCameraListener.onCameraOpened();
+
     }
 
     private void setupPreview() {
